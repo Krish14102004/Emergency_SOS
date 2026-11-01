@@ -36,7 +36,20 @@ class PhoneNumberValidatorTest {
     }
 
     @Test
-    fun alertStatusesDoNotClaimDeliveryBeforeAProviderCallback() {
+    fun composerStatusesDoNotClaimThatSmsWasSentOrDelivered() {
+        assertTrue(AlertStatus.PENDING.canTransitionTo(AlertStatus.READY_TO_COMPOSE))
+        assertTrue(AlertStatus.READY_TO_COMPOSE.canTransitionTo(AlertStatus.COMPOSER_OPENED))
+        assertTrue(AlertStatus.COMPOSER_OPENED.canTransitionTo(AlertStatus.COMPOSER_OPENED))
+        assertTrue(AlertStatus.READY_TO_COMPOSE.canTransitionTo(AlertStatus.COMPOSER_FAILED))
+        assertTrue(AlertStatus.COMPOSER_FAILED.canTransitionTo(AlertStatus.COMPOSER_OPENED))
+        assertFalse(AlertStatus.READY_TO_COMPOSE.canTransitionTo(AlertStatus.DELIVERED))
+        assertFalse(AlertStatus.COMPOSER_OPENED.canTransitionTo(AlertStatus.DELIVERED))
+        assertFalse(AlertStatus.COMPOSER_FAILED.canTransitionTo(AlertStatus.DELIVERED))
+        assertFalse(AlertStatus.PENDING.canTransitionTo(AlertStatus.DELIVERED))
+    }
+
+    @Test
+    fun legacyAlertStatusesKeepTheirOriginalTransitions() {
         assertTrue(AlertStatus.PENDING.canTransitionTo(AlertStatus.SENDING))
         assertTrue(AlertStatus.SENDING.canTransitionTo(AlertStatus.SUBMITTED))
         assertTrue(AlertStatus.SUBMITTED.canTransitionTo(AlertStatus.DELIVERED))

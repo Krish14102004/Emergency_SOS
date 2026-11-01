@@ -94,7 +94,7 @@ class MainActivity : Activity() {
             }
         )
         addView(
-            text("REAL SMS · Confirm before sending. Location is not included in the text.", 13f, COLOR_RED_DARK)
+            text("SMS APP HANDOFF · Review and tap Send. No SMS permission is used.", 13f, COLOR_RED_DARK)
                 .apply { setPadding(dp(10), 0, 0, 0) },
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         )
@@ -181,9 +181,9 @@ class MainActivity : Activity() {
 
     private fun createAlertsCard(): View {
         val card = createCard()
-        card.addView(sectionTitle("SMS delivery status"))
+        card.addView(sectionTitle("SMS draft status"))
         card.addView(
-            text("Submitted, delivered, and failed statuses are tracked separately.", 12f, COLOR_MUTED),
+            text("The app cannot verify sending or delivery. You send each draft from your SMS app.", 12f, COLOR_MUTED),
             marginParams(top = 3, bottom = 8)
         )
         alertsList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -230,15 +230,16 @@ class MainActivity : Activity() {
         }
 
         AlertDialog.Builder(this)
-            .setTitle("Send real SOS text messages?")
+            .setTitle("Prepare SOS text messages?")
             .setMessage(
-                "One SMS will be sent now to each of these numbers:\n\n" +
+                "The SMS app will open with a message addressed to each number. You must review and tap Send there:\n\n" +
                     phoneNumbers.joinToString("\n") +
                     "\n\nThe SMS will not include your GPS location. Your carrier may charge for messages. " +
-                    "Only continue if you intend to notify these recipients now. For testing, use consenting contacts."
+                    "This app does not send SMS or use SMS permission. Only continue if you intend to notify these recipients. " +
+                    "For testing, use consenting contacts."
             )
             .setNegativeButton("Cancel", null)
-            .setPositiveButton("Confirm and continue") { _, _ ->
+            .setPositiveButton("Prepare SOS") { _, _ ->
                 requestPermissionsAndStart(phoneNumbers, useLocation)
             }
             .show()
@@ -246,9 +247,6 @@ class MainActivity : Activity() {
 
     private fun requestPermissionsAndStart(phoneNumbers: List<String>, useLocation: Boolean) {
         val required = buildList {
-            if (checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) {
-                add(Manifest.permission.SEND_SMS)
-            }
             if (useLocation && !hasLocationPermission()) {
                 add(Manifest.permission.ACCESS_COARSE_LOCATION)
                 add(Manifest.permission.ACCESS_FINE_LOCATION)
@@ -293,13 +291,6 @@ class MainActivity : Activity() {
             pendingPhoneNumbers = null
             if (phoneNumbers == null) return
 
-            if (checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) {
-                showMessage(
-                    "SMS permission required",
-                    "No SOS session was started and no message was sent. Grant SMS permission to use direct alerts."
-                )
-                return
-            }
             val locationGranted = pendingUseLocation && hasLocationPermission()
             if (pendingUseLocation && !locationGranted) {
                 showMessage(
@@ -379,7 +370,10 @@ class MainActivity : Activity() {
         event?.alerts?.forEach { attempt ->
             val status = when (attempt.status) {
                 AlertStatus.PENDING -> "PENDING"
-                AlertStatus.SENDING -> "SENDING"
+                AlertStatus.READY_TO_COMPOSE -> "READY · NOT SENT"
+                AlertStatus.COMPOSER_OPENED -> "OPENED · NOT CONFIRMED"
+                AlertStatus.COMPOSER_FAILED -> "COULD NOT OPEN"
+                AlertStatus.SENDING -> "LEGACY · SENDING"
                 AlertStatus.SUBMITTED -> "SUBMITTED · NOT DELIVERED"
                 AlertStatus.SUBMISSION_UNCONFIRMED -> "SUBMISSION UNKNOWN"
                 AlertStatus.DELIVERED -> "DELIVERED"
@@ -388,8 +382,11 @@ class MainActivity : Activity() {
                 AlertStatus.SIMULATED_SUBMITTED -> "LEGACY DEMO"
             }
             val (badgeColor, badgeBackground) = when (attempt.status) {
+                AlertStatus.PENDING, AlertStatus.READY_TO_COMPOSE, AlertStatus.COMPOSER_FAILED,
+                AlertStatus.SENDING ->
+                    COLOR_MUTED to COLOR_NEUTRAL_TINT
+                AlertStatus.COMPOSER_OPENED -> COLOR_GREEN_DARK to COLOR_GREEN_TINT
                 AlertStatus.SUBMITTED, AlertStatus.DELIVERED -> COLOR_GREEN_DARK to COLOR_GREEN_TINT
-                AlertStatus.PENDING, AlertStatus.SENDING -> COLOR_MUTED to COLOR_NEUTRAL_TINT
                 else -> COLOR_RED_DARK to COLOR_RED_TINT
             }
             alertsList.addView(
@@ -398,6 +395,42 @@ class MainActivity : Activity() {
                     addView(labeledRow(attempt.contact, status, badgeColor, badgeBackground))
                     attempt.statusMessage?.let {
                         addView(text(it, 11f, COLOR_MUTED), marginParams(bottom = 5))
+                    }
+                    if (state != EmergencyState.CLOSED &&
+                        (attempt.status == AlertStatus.READY_TO_COMPOSE ||
+                            attempt.status == AlertStatus.COMPOSER_OPENED ||
+                            attempt.status == AlertStatus.COMPOSER_FAILED)
+                    ) {
+                        addView(
+                            actionButton(
+                                label = if (attempt.status == AlertStatus.COMPOSER_OPENED) {
+                                    "OPEN ANOTHER DRAFT"
+                                } else if (attempt.status == AlertStatus.COMPOSER_FAILED) {
+                                    "TRY OPENING SMS APP AGAIN"
+                                } else {
+                                    "OPEN SMS APP"
+                                },
+                                fill = COLOR_GREEN_TINT,
+                                textColor = COLOR_GREEN_DARK
+                            ) {
+                                if (attempt.status == AlertStatus.COMPOSER_OPENED) {
+                                    AlertDialog.Builder(this@MainActivity)
+                                        .setTitle("Open another draft?")
+                                        .setMessage(
+                                            "A new SMS draft will open for ${attempt.contact}. If you already sent the previous message, " +
+                                                "sending again may create a duplicate."
+                                        )
+                                        .setNegativeButton("Cancel", null)
+                                        .setPositiveButton("Open draft") { _, _ ->
+                                            coordinator.openSmsComposer(attempt.alertId)
+                                        }
+                                        .show()
+                                } else {
+                                    coordinator.openSmsComposer(attempt.alertId)
+                                }
+                            },
+                            marginParams(top = 5)
+                        )
                     }
                 }
             )

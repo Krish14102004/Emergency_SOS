@@ -6,6 +6,9 @@ enum class EmergencyState { IDLE, INITIATED, ALERTING, ACTIVE, CLOSED }
 enum class LocationStatus { PENDING, AVAILABLE, UNAVAILABLE }
 enum class AlertStatus {
     PENDING,
+    READY_TO_COMPOSE,
+    COMPOSER_OPENED,
+    COMPOSER_FAILED,
     SENDING,
     SUBMITTED,
     SUBMISSION_UNCONFIRMED,
@@ -15,6 +18,11 @@ enum class AlertStatus {
     SIMULATED_SUBMITTED;
 
     fun canTransitionTo(next: AlertStatus): Boolean = when (next) {
+        READY_TO_COMPOSE -> this == PENDING
+        COMPOSER_OPENED -> this == READY_TO_COMPOSE || this == COMPOSER_OPENED ||
+            this == COMPOSER_FAILED
+        COMPOSER_FAILED -> this == READY_TO_COMPOSE || this == COMPOSER_OPENED ||
+            this == COMPOSER_FAILED
         SENDING -> this == PENDING
         SUBMITTED -> this == SENDING || this == SUBMISSION_UNCONFIRMED
         SUBMISSION_UNCONFIRMED -> this == SENDING
