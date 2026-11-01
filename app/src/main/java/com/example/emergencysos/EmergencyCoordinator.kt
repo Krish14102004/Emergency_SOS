@@ -1,20 +1,30 @@
 package com.example.emergencysos
 
 import android.content.Context
+import android.content.BroadcastReceiver
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.os.Handler
 import android.os.Looper
+import android.Manifest
+import android.util.Log
+import androidx.core.content.ContextCompat
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-/** Coordinates locally stored sessions, foreground location, and simulated alert attempts. */
+/** Coordinates locally stored sessions, foreground location, and confirmed SMS attempts. */
 class EmergencyCoordinator(
     context: Context,
     private val onChange: () -> Unit
 ) {
+    private val appContext = context.applicationContext
     private val handler = Handler(Looper.getMainLooper())
-    private val locationTracker = LocationTracker(context)
-    private val sessionStore = SessionStore(context)
+    private val locationTracker = LocationTracker(appContext)
+    private val sessionStore = SessionStore(appContext)
+    private val smsDispatcher = SmsAlertDispatcher(appContext)
+    private val smsTimeouts = mutableMapOf<String, Runnable>()
     private val history = mutableListOf<EmergencyEvent>()
     private var activeEvent: EmergencyEvent? = null
     private var lastMessage = "Ready. Start an SOS to create a saved session."
@@ -25,8 +35,16 @@ class EmergencyCoordinator(
     private var hasLocationPermission = false
     private var historyLoadError: String? = null
     private var locationTimeout: Runnable? = null
+    private var isStatusReceiverRegistered = false
+    private val smsStatusReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != SmsAlertDispatcher.ACTION_STATUS_CHANGED) return
+            refreshSmsStatuses(intent)
+        }
+    }
 
     init {
+        registerSmsStatusReceiver()
         val saved = sessionStore.load()
         saved.onSuccess { events ->
             history.addAll(events)
@@ -42,7 +60,11 @@ class EmergencyCoordinator(
 
     fun snapshot() = DemoSnapshot(activeEvent, history.toList(), lastMessage)
 
-    fun startSos(contactNames: List<String>, hasLocationPermission: Boolean) {
+    fun startSos(
+        phoneNumbers: List<String>,
+        hasLocationPermission: Boolean,
+        locationPermissionRequested: Boolean = hasLocationPermission
+    ) {
         historyLoadError?.let {
             lastMessage = "A new session was not started because saved history could not be read: $it"
             notifyChanged()
@@ -56,18 +78,23 @@ class EmergencyCoordinator(
             return
         }
 
-        val contacts = contactNames.map { it.trim() }
-            .filter { it.isNotEmpty() }
-            .distinctBy { it.lowercase(Locale.ROOT) }
-        if (contacts.isEmpty()) {
-            lastMessage = "Enter at least one demo contact before starting."
+        val validatedContacts = PhoneNumberValidator.normalizeAll(phoneNumbers)
+        if (validatedContacts.isFailure) {
+            lastMessage = validatedContacts.exceptionOrNull()?.message ?: "Check the phone numbers and try again."
+            notifyChanged()
+            return
+        }
+        if (ContextCompat.checkSelfPermission(appContext, Manifest.permission.SEND_SMS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            lastMessage = "SMS permission is not granted. No messages were sent."
             notifyChanged()
             return
         }
 
         handler.removeCallbacksAndMessages(null)
         val event = EmergencyEvent(
-            alerts = contacts.mapTo(mutableListOf()) { AlertAttempt(it) }
+            alerts = validatedContacts.getOrThrow().mapTo(mutableListOf()) { AlertAttempt(it) }
         )
         history.add(event)
         if (history.size > MAX_SAVED_EVENTS) history.removeAt(0)
@@ -78,16 +105,23 @@ class EmergencyCoordinator(
         this.hasLocationPermission = hasLocationPermission
         addActivity(event, "Emergency event created (${event.id.take(8)}).")
         event.state = EmergencyState.ALERTING
-        addActivity(event, "Alert workflow started; each demo alert proceeds independently of location.")
-        lastMessage = "SOS active in simulation mode. No messages or calls are sent."
+        addActivity(event, "Sending one SMS to each confirmed contact; location acquisition runs independently.")
+        addActivity(event, "SMS contains no GPS coordinates. No location follow-up message will be sent.")
+        lastMessage = "SOS started. SMS send status is being checked; delivery is not guaranteed."
         persist()
 
-        dispatchSimulatedAlerts(event)
+        dispatchSmsAlerts(event)
+        alertsFinished = true
         if (hasLocationPermission) {
             requestInitialLocation(event)
         } else {
             event.locationStatus = LocationStatus.UNAVAILABLE
-            addActivity(event, "Location permission unavailable; alert processing continues without coordinates.")
+            val locationMessage = if (locationPermissionRequested) {
+                "Location permission was denied; SMS sent without coordinates."
+            } else {
+                "SOS started without requesting location; SMS sent without coordinates."
+            }
+            addActivity(event, locationMessage)
             completeWorkflowIfReady(event)
             persist()
         }
@@ -100,14 +134,14 @@ class EmergencyCoordinator(
             notifyChanged()
             return
         }
-        handler.removeCallbacksAndMessages(null)
+        locationTimeout?.let(handler::removeCallbacks)
         locationTimeout = null
         locationTracker.stop()
         event.state = EmergencyState.CLOSED
         if (event.locationStatus == LocationStatus.PENDING) {
             event.locationStatus = LocationStatus.UNAVAILABLE
         }
-        addActivity(event, "Session closed; location updates stopped. Pending demo alerts were cancelled.")
+        addActivity(event, "Session closed; location updates stopped. Already sent SMS may still be delivered.")
         lastMessage = "Session ${event.id.take(8)} closed and saved."
         persist()
     }
@@ -120,21 +154,21 @@ class EmergencyCoordinator(
 
         if (event.state != EmergencyState.ACTIVE) {
             if (event.state == EmergencyState.ALERTING) {
-                handler.removeCallbacksAndMessages(null)
+                locationTimeout?.let(handler::removeCallbacks)
                 locationTracker.stop()
                 locationTimeout = null
-                event.alerts.filter { it.status == AlertStatus.PENDING }.forEach {
-                    it.status = AlertStatus.SIMULATED_SUBMITTED
-                }
                 alertsFinished = true
                 locationResolved = true
                 if (event.locationStatus == LocationStatus.PENDING) {
                     event.locationStatus = LocationStatus.UNAVAILABLE
                 }
                 event.state = EmergencyState.ACTIVE
-                addActivity(event, "Incomplete foreground demo steps were resolved after reopening the app.")
+                addActivity(event, "Session restored; SMS statuses are read from local delivery callbacks.")
                 persist()
             }
+        }
+        event.alerts.filter { it.status == AlertStatus.SENDING }.forEach {
+            scheduleSmsCallbackTimeout(event, it)
         }
 
         if (!hasLocationPermission) {
@@ -179,19 +213,126 @@ class EmergencyCoordinator(
         handler.removeCallbacksAndMessages(null)
         locationTimeout = null
         locationTracker.stop()
+        if (isStatusReceiverRegistered) {
+            appContext.unregisterReceiver(smsStatusReceiver)
+            isStatusReceiverRegistered = false
+        }
     }
 
-    private fun dispatchSimulatedAlerts(event: EmergencyEvent) {
-        event.alerts.forEachIndexed { index, attempt ->
-            handler.postDelayed({
-                if (!isCurrent(event)) return@postDelayed
-                attempt.status = AlertStatus.SIMULATED_SUBMITTED
-                addActivity(event, "Demo alert step completed for ${attempt.contact}; no message was sent.")
-                alertsFinished = event.alerts.all { it.status != AlertStatus.PENDING }
-                completeWorkflowIfReady(event)
+    private fun dispatchSmsAlerts(event: EmergencyEvent) {
+        event.alerts.forEach { attempt ->
+            attempt.status = AlertStatus.SENDING
+            attempt.statusMessage = "Waiting for Android's SMS status callback."
+            addActivity(event, "Requesting one SMS send for ${attempt.contact}.")
+            persist()
+            val result = smsDispatcher.send(
+                phoneNumber = attempt.contact,
+                message = buildAlertMessage(event),
+                eventId = event.id,
+                alertId = attempt.alertId
+            )
+            result.onSuccess {
+                scheduleSmsCallbackTimeout(event, attempt)
+            }.onFailure { error ->
+                attempt.status = AlertStatus.FAILED
+                attempt.statusMessage = error.message ?: "Android could not start the SMS send."
+                addActivity(event, "SMS send failed for ${attempt.contact}: ${attempt.statusMessage}")
                 persist()
-            }, ALERT_STEP_DELAY_MS + index * ALERT_STEP_DELAY_MS)
+            }
         }
+
+    }
+
+    private fun scheduleSmsCallbackTimeout(event: EmergencyEvent, attempt: AlertAttempt) {
+        if (smsTimeouts.containsKey(attempt.alertId)) return
+        val timeout = Runnable {
+            smsTimeouts.remove(attempt.alertId)
+            if (history.none { it.id == event.id } || attempt.status != AlertStatus.SENDING) return@Runnable
+            sessionStore.updateAlertStatus(
+                event.id,
+                attempt.alertId,
+                AlertStatus.SUBMISSION_UNCONFIRMED,
+                "No Android send callback was received. The message may or may not have been submitted."
+            ).onFailure { error ->
+                Log.e(TAG, "Could not save an unconfirmed SMS status.", error)
+                lastMessage = "SMS status could not be saved: ${error.message ?: "storage error"}"
+            }
+            reloadHistoryAndNotify()
+        }
+        smsTimeouts[attempt.alertId] = timeout
+        handler.postDelayed(timeout, SMS_CALLBACK_TIMEOUT_MS)
+    }
+
+    private fun buildAlertMessage(event: EmergencyEvent) =
+        "EMERGENCY SOS. Please contact me now. Event ${event.id.take(8)}. " +
+            "GPS is not in this SMS. Call local emergency services if urgent."
+
+    private fun registerSmsStatusReceiver() {
+        val filter = IntentFilter(SmsAlertDispatcher.ACTION_STATUS_CHANGED)
+        ContextCompat.registerReceiver(
+            appContext,
+            smsStatusReceiver,
+            filter,
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        isStatusReceiverRegistered = true
+    }
+
+    private fun refreshSmsStatuses(intent: Intent) {
+        val eventId = intent.getStringExtra(SmsAlertDispatcher.EXTRA_EVENT_ID)
+        val alertId = intent.getStringExtra(SmsAlertDispatcher.EXTRA_ALERT_ID)
+        val status = intent.getStringExtra(SmsAlertDispatcher.EXTRA_STATUS)
+        val storageError = intent.getStringExtra(SmsAlertDispatcher.EXTRA_STORAGE_ERROR)
+        if (eventId.isNullOrBlank() || alertId.isNullOrBlank() || status.isNullOrBlank()) {
+            lastMessage = "Received an incomplete SMS status callback."
+            notifyChanged()
+            return
+        }
+        smsTimeouts.remove(alertId)?.let(handler::removeCallbacks)
+        storageError?.let {
+            lastMessage = "SMS callback was received but its status could not be saved: $it"
+            notifyChanged()
+            return
+        }
+        reloadHistoryAndNotify()
+        val parsedStatus = try {
+            AlertStatus.valueOf(status)
+        } catch (_: IllegalArgumentException) {
+            null
+        }
+        lastMessage = when (parsedStatus) {
+            AlertStatus.SUBMITTED -> "Android/carrier accepted the SMS request. This does not confirm delivery."
+            AlertStatus.DELIVERED -> "Carrier delivery was confirmed; this does not confirm that the recipient read it."
+            AlertStatus.FAILED -> "The phone reported that an SMS send attempt failed."
+            AlertStatus.DELIVERY_UNCONFIRMED -> "SMS delivery could not be confirmed by the carrier."
+            AlertStatus.SUBMISSION_UNCONFIRMED -> "No SMS submission callback arrived. The message may or may not have been submitted."
+            else -> "SMS status updated."
+        }
+        notifyChanged()
+    }
+
+    private fun reloadHistoryAndNotify() {
+        sessionStore.load().onSuccess { savedEvents ->
+            savedEvents.forEach { saved ->
+                val current = history.firstOrNull { it.id == saved.id }
+                if (current == null) {
+                    history.add(saved)
+                } else {
+                    saved.alerts.forEach { savedAlert ->
+                        current.alerts.firstOrNull { it.alertId == savedAlert.alertId }?.let { currentAlert ->
+                            currentAlert.status = savedAlert.status
+                            currentAlert.statusMessage = savedAlert.statusMessage
+                        }
+                    }
+                    current.activity.clear()
+                    current.activity.addAll(saved.activity)
+                }
+            }
+            activeEvent = history.lastOrNull { it.state != EmergencyState.CLOSED }
+        }.onFailure { error ->
+            lastMessage = "Could not reload saved SMS status: ${error.message ?: "invalid saved data"}"
+        }
+        notifyChanged()
     }
 
     private fun requestInitialLocation(event: EmergencyEvent) {
@@ -241,7 +382,7 @@ class EmergencyCoordinator(
         if (event.state == EmergencyState.ALERTING) {
             event.state = EmergencyState.ACTIVE
             addActivity(event, "Session active. Alert attempts and location status are shown separately.")
-            lastMessage = "Session active (${event.id.take(8)}). Alerts are simulation-only."
+            lastMessage = "Session active (${event.id.take(8)}). SMS status is shown per contact."
             startLocationUpdates(event)
         }
     }
@@ -330,12 +471,13 @@ class EmergencyCoordinator(
     private fun notifyChanged() = onChange()
 
     companion object {
+        private const val TAG = "EmergencyCoordinator"
         private const val LOCATION_TIMEOUT_MS = 5_000L
+        private const val SMS_CALLBACK_TIMEOUT_MS = 60_000L
         private const val MAX_LOCATION_AGE_MS = 60_000L
         private const val PREFERRED_LOCATION_AGE_SECONDS = 30L
         private const val MAX_ACCEPTED_ACCURACY_METERS = 100f
         private const val PREFERRED_ACCURACY_METERS = 50f
-        private const val ALERT_STEP_DELAY_MS = 500L
         private const val MAX_ACTIVITY_ITEMS = 40
         private const val MAX_SAVED_EVENTS = 20
     }

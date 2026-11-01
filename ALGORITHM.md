@@ -2,27 +2,29 @@
 
 ## Purpose and scope
 
-This prototype demonstrates SOS orchestration with actual foreground device location and locally persisted session history. Per-contact alerts remain simulated: the app does not send SMS, place calls, or contact a backend or emergency service.
+This prototype demonstrates SOS orchestration with actual foreground device location, locally persisted session history, and direct SMS attempts to confirmed phone numbers. It does not place calls or contact a backend or emergency service.
 
 ## Main flow
 
 ```text
-START SOS(contact list, location permission)
+CONFIRM SOS(phone number list, location choice)
   1. If a session is already active, ignore the duplicate request.
-  2. Remove blank and duplicate contact entries.
-  3. If no contacts remain, show a validation message and stop.
-  4. Create a unique event, add it to local history, and save it.
-  5. Move to ALERTING and start two independent workflows:
-       a. Mark each contact's alert PENDING, then SIMULATED_SUBMITTED.
-       b. Request a current device location with a five-second deadline.
-  6. If a usable fix arrives, record coordinates, reported accuracy, and timestamp.
+  2. Normalize and validate 1-5 unique phone numbers.
+  3. Show the exact destination numbers and SMS warning; require explicit confirmation.
+  4. Request Android SEND_SMS permission. If permission is denied, send nothing and stop.
+  5. Create a unique event, persist each alert ID, and move to ALERTING.
+  6. Request one SMS per confirmed number immediately; record send failures separately.
+  7. In parallel, if requested and permitted, obtain current device location
+     with a five-second deadline.
+  8. If a usable fix arrives, record coordinates, reported accuracy, and timestamp.
      Otherwise, mark location UNAVAILABLE; alert processing continues.
-  7. When both workflows resolve, move the session to ACTIVE.
-  8. While the app is visible, publish valid location updates about every 10 seconds.
-     Save each accepted update to the local session.
-  9. When the app leaves the foreground, stop location updates.
+  9. Mark the session ACTIVE when initial dispatch and location resolve.
+ 10. Process per-SMS sent/delivery callbacks and persist each status separately.
+     Never equate submission with delivery or reading.
+ 11. While the app is visible, save valid location updates about every 10 seconds.
+ 12. When the app leaves the foreground, stop location updates.
      Resume them when the app returns and permission is still granted.
- 10. On END SESSION, stop location updates and save the CLOSED state.
+ 13. On END SESSION, stop location updates and save the CLOSED state.
 END
 ```
 
@@ -30,13 +32,25 @@ END
 
 | Current state | Event | Next state |
 | --- | --- | --- |
-| IDLE or CLOSED | Valid SOS request | INITIATED |
-| INITIATED | Alert workflow begins | ALERTING |
-| ALERTING | Alerts and location have both resolved | ACTIVE |
+| IDLE or CLOSED | Valid, confirmed SOS request | INITIATED |
+| INITIATED | SMS dispatch begins | ALERTING |
+| ALERTING | SMS dispatch attempts and location resolution finish | ACTIVE |
 | ACTIVE | User ends the session | CLOSED |
 | Any non-closed state | Duplicate SOS request | No state change |
 
-Location availability and alert status are recorded separately from the session state. An unavailable location does not prevent the session from becoming active. If the app is reopened with an unfinished alerting session, it restores the saved event and resolves unfinished demo steps without claiming real delivery.
+Location availability and per-recipient SMS status are recorded separately from the session state. A failed SMS or unavailable location does not silently become a success and does not prevent the session from becoming active. The app does not automatically resend messages after a restart.
+
+## SMS delivery status
+
+- The user must confirm the exact phone numbers before Android permission is requested and before any SMS send.
+- Phone numbers are normalized and limited to 1-5 unique entries per SOS.
+- One SMS is sent to each number. It does not contain GPS coordinates; no location-follow-up message is sent.
+- `SENDING`: Android send was requested and a callback is pending.
+- `SUBMITTED`: the Android sent callback reported success; human delivery is not implied.
+- `DELIVERED`: the device/carrier reported delivery; this does not confirm that a person read it.
+- `FAILED`: the device reported a failed send request.
+- `SUBMISSION_UNCONFIRMED` / `DELIVERY_UNCONFIRMED`: the corresponding status could not be verified. No automatic retry is attempted.
+- SMS attempts and callback statuses are saved per event and per recipient. If the app restarts, a stale attempt is not automatically sent again.
 
 ## Location validation and storage
 
@@ -45,22 +59,19 @@ Location availability and alert status are recorded separately from the session 
 - A fix no older than 30 seconds with accuracy of 50 m or better is reported as preferred quality; other accepted fixes are shown as lower confidence.
 - Live updates request a 10-second interval and reject invalid coordinates, stale fixes, poor accuracy, and out-of-order timestamps.
 - The app requests foreground-only permission. Updates stop when the app is not visible.
-- Up to 20 events are stored in the app's private SharedPreferences, including status, contact demo labels, activity timeline, and last location.
+- Up to 20 events are stored in the app's private SharedPreferences, including recipient phone numbers, alert statuses, activity timeline, and last location.
 - A unique event ID is generated for each session; only one session may be active at a time.
-
-## Alert demonstration
-
-Two sample contact names are pre-filled and editable. Each alert remains `PENDING` until its simulated step runs, then displays `SIMULATED · NOT SENT`. This status is not evidence that a message was submitted or delivered.
 
 ## Review checklist
 
-1. Choose **START SOS · USE PHONE LOCATION** and grant foreground location permission.
-2. Observe the actual coordinates, accuracy, timestamp, and periodic update count.
-3. Tap Start again while active; the duplicate request should be ignored.
-4. End the session; the state changes to CLOSED and tracking stops.
-5. Start with **CONTINUE WITHOUT LOCATION**; alerts still resolve and the session becomes active without coordinates.
-6. Close and reopen the app; previously saved sessions should remain in the history.
+1. Enter a test number you own and confirm the exact destination in the confirmation dialog.
+2. Grant Android SMS permission. Grant foreground location permission if you selected location.
+3. Check the recipient device and app status. A sent callback is not a read receipt.
+4. Tap Start again while active; the duplicate request should be ignored.
+5. End the session; the state changes to CLOSED and location tracking stops.
+6. Start without location; the SMS should still be sent and the session should record location as unavailable.
+7. Close and reopen the app; previously saved sessions and delivery states should remain in history.
 
-## Intentionally out of scope
+## Limitations
 
-This prototype does not implement authentication, contact verification, real SMS, delivery callbacks, retry policies, cloud backup, backend authorization, background tracking, or emergency-service integration. The on-device history is not encrypted separately from Android's app-private storage. Location is sensitive personal data; clear app data or uninstall to remove this prototype's local history. Simulated alert statuses must not be presented as real-world delivery or safety guarantees.
+This prototype does not implement authentication, contact verification, automatic retries, cloud backup, backend authorization, background tracking, or emergency-service integration. Android/carrier delivery callbacks are not guaranteed. The on-device history contains destination phone numbers and location and is not encrypted separately from Android's app-private storage. Test only with consenting recipients; carrier charges may apply. This prototype is not a production emergency service and must not be relied on in an actual emergency.

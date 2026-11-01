@@ -5,35 +5,62 @@ import android.util.Log
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
+import java.util.UUID
 
 /** Stores a bounded session history on this device. */
 class SessionStore(context: Context) {
     private val preferences = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
 
-    fun load(): Result<MutableList<EmergencyEvent>> = try {
+    fun load(): Result<MutableList<EmergencyEvent>> = synchronized(STORE_LOCK) {
+        try {
         val json = preferences.getString(KEY_EVENTS, null)
         val events = if (json == null) mutableListOf() else decode(JSONArray(json))
         Result.success(events)
-    } catch (error: JSONException) {
-        Log.e(TAG, "Saved emergency history could not be decoded.", error)
-        Result.failure(error)
-    } catch (error: IllegalArgumentException) {
-        Log.e(TAG, "Saved emergency history contains an unknown state.", error)
-        Result.failure(error)
+        } catch (error: JSONException) {
+            Log.e(TAG, "Saved emergency history could not be decoded.", error)
+            Result.failure(error)
+        } catch (error: IllegalArgumentException) {
+            Log.e(TAG, "Saved emergency history contains an unknown state.", error)
+            Result.failure(error)
+        }
     }
 
-    fun save(events: List<EmergencyEvent>): Result<Unit> = try {
-        val encoded = encode(events.takeLast(MAX_SAVED_EVENTS)).toString()
-        if (!preferences.edit().putString(KEY_EVENTS, encoded).commit()) {
-            throw IllegalStateException("Android could not save emergency history.")
+    fun save(events: List<EmergencyEvent>): Result<Unit> = synchronized(STORE_LOCK) {
+        try {
+            val encoded = encode(events.takeLast(MAX_SAVED_EVENTS)).toString()
+            if (!preferences.edit().putString(KEY_EVENTS, encoded).commit()) {
+                throw IllegalStateException("Android could not save emergency history.")
+            }
+            Result.success(Unit)
+        } catch (error: JSONException) {
+            Log.e(TAG, "Emergency history could not be encoded.", error)
+            Result.failure(error)
+        } catch (error: IllegalStateException) {
+            Log.e(TAG, "Emergency history could not be saved.", error)
+            Result.failure(error)
         }
-        Result.success(Unit)
-    } catch (error: JSONException) {
-        Log.e(TAG, "Emergency history could not be encoded.", error)
-        Result.failure(error)
-    } catch (error: IllegalStateException) {
-        Log.e(TAG, "Emergency history could not be saved.", error)
-        Result.failure(error)
+    }
+
+    fun updateAlertStatus(
+        eventId: String,
+        alertId: String,
+        status: AlertStatus,
+        message: String?
+    ): Result<Unit> = synchronized(STORE_LOCK) {
+        val loaded = load()
+        val events = loaded.getOrElse { return@synchronized Result.failure(it) }
+        val event = events.firstOrNull { it.id == eventId }
+            ?: return@synchronized Result.failure(IllegalStateException("Emergency session was not found."))
+        val alert = event.alerts.firstOrNull { it.alertId == alertId }
+            ?: return@synchronized Result.failure(IllegalStateException("SMS alert attempt was not found."))
+
+        if (!alert.status.canTransitionTo(status)) return@synchronized Result.success(Unit)
+
+        alert.status = status
+        alert.statusMessage = message
+        event.activity.add("${timestamp()} SMS to ${alert.contact}: ${status.name}${message?.let { " — $it" } ?: ""}")
+        if (event.activity.size > MAX_ACTIVITY_ITEMS) event.activity.removeAt(0)
+        save(events)
     }
 
     private fun encode(events: List<EmergencyEvent>) = JSONArray().apply {
@@ -50,7 +77,9 @@ class SessionStore(context: Context) {
                     event.alerts.forEach { alert ->
                         put(JSONObject().apply {
                             put("contact", alert.contact)
+                            put("alertId", alert.alertId)
                             put("status", alert.status.name)
+                            put("statusMessage", alert.statusMessage ?: JSONObject.NULL)
                         })
                     }
                 })
@@ -75,7 +104,11 @@ class SessionStore(context: Context) {
                 val alert = alertsJson.getJSONObject(alertIndex)
                 AlertAttempt(
                     contact = alert.getString("contact"),
-                    status = AlertStatus.valueOf(alert.getString("status"))
+                    alertId = alert.optString("alertId").takeIf { it.isNotBlank() }
+                        ?: UUID.randomUUID().toString(),
+                    status = AlertStatus.valueOf(alert.getString("status")),
+                    statusMessage = if (alert.isNull("statusMessage")) null
+                        else alert.optString("statusMessage").takeIf { it.isNotBlank() }
                 )
             },
             activity = MutableList(activityJson.length()) { activityIndex ->
@@ -101,9 +134,16 @@ class SessionStore(context: Context) {
     )
 
     companion object {
+        private val STORE_LOCK = Any()
         private const val PREFERENCES_NAME = "emergency_session_history"
         private const val KEY_EVENTS = "events"
         private const val MAX_SAVED_EVENTS = 20
+        private const val MAX_ACTIVITY_ITEMS = 40
         private const val TAG = "EmergencySessionStore"
+
+        private fun timestamp(): String =
+            java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
+                .format(java.util.Date())
+
     }
 }

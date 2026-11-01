@@ -4,11 +4,34 @@ import java.util.UUID
 
 enum class EmergencyState { IDLE, INITIATED, ALERTING, ACTIVE, CLOSED }
 enum class LocationStatus { PENDING, AVAILABLE, UNAVAILABLE }
-enum class AlertStatus { PENDING, SIMULATED_SUBMITTED }
+enum class AlertStatus {
+    PENDING,
+    SENDING,
+    SUBMITTED,
+    SUBMISSION_UNCONFIRMED,
+    DELIVERED,
+    FAILED,
+    DELIVERY_UNCONFIRMED,
+    SIMULATED_SUBMITTED;
+
+    fun canTransitionTo(next: AlertStatus): Boolean = when (next) {
+        SENDING -> this == PENDING
+        SUBMITTED -> this == SENDING || this == SUBMISSION_UNCONFIRMED
+        SUBMISSION_UNCONFIRMED -> this == SENDING
+        DELIVERED -> this == SENDING || this == SUBMITTED ||
+            this == SUBMISSION_UNCONFIRMED || this == DELIVERY_UNCONFIRMED
+        FAILED -> this == SENDING || this == PENDING || this == SUBMISSION_UNCONFIRMED
+        DELIVERY_UNCONFIRMED -> this == SENDING || this == SUBMITTED ||
+            this == SUBMISSION_UNCONFIRMED
+        PENDING, SIMULATED_SUBMITTED -> false
+    }
+}
 
 data class AlertAttempt(
     val contact: String,
-    var status: AlertStatus = AlertStatus.PENDING
+    val alertId: String = UUID.randomUUID().toString(),
+    var status: AlertStatus = AlertStatus.PENDING,
+    var statusMessage: String? = null
 )
 
 data class LocationSnapshot(

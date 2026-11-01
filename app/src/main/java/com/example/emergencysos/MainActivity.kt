@@ -2,6 +2,7 @@ package com.example.emergencysos
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
@@ -27,6 +28,8 @@ class MainActivity : Activity() {
     private lateinit var historyList: LinearLayout
     private lateinit var coordinator: EmergencyCoordinator
     private var permissionRequestPending = false
+    private var pendingPhoneNumbers: List<String>? = null
+    private var pendingUseLocation = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -91,7 +94,7 @@ class MainActivity : Activity() {
             }
         )
         addView(
-            text("GPS is real. Alerts are simulated; no SMS or calls are sent.", 13f, COLOR_RED_DARK)
+            text("REAL SMS · Confirm before sending. Location is not included in the text.", 13f, COLOR_RED_DARK)
                 .apply { setPadding(dp(10), 0, 0, 0) },
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         )
@@ -129,16 +132,16 @@ class MainActivity : Activity() {
                 label = "START SOS · USE PHONE LOCATION",
                 fill = COLOR_RED,
                 textColor = Color.WHITE,
-                onClick = { requestLocationAndStart() }
+                onClick = { confirmSos(useLocation = true) }
             ),
             marginParams(top = 14)
         )
         card.addView(
             actionButton(
-                label = "CONTINUE WITHOUT LOCATION",
+                label = "SEND SOS · WITHOUT GPS",
                 fill = COLOR_GREEN_TINT,
                 textColor = COLOR_GREEN_DARK,
-                onClick = { startSos(hasLocationPermission = false) }
+                onClick = { confirmSos(useLocation = false) }
             ),
             marginParams(top = 8)
         )
@@ -156,14 +159,13 @@ class MainActivity : Activity() {
 
     private fun createContactsCard(): View {
         val card = createCard()
-        card.addView(sectionTitle("Demo contacts"))
+        card.addView(sectionTitle("Emergency phone numbers"))
         card.addView(
-            text("Names only · no messages are sent", 12f, COLOR_MUTED),
+            text("Enter numbers you own or have permission to contact. Include country code.", 12f, COLOR_MUTED),
             marginParams(top = 3, bottom = 8)
         )
         contactsInput = EditText(this).apply {
-            setText("Asha (Demo), Ravi (Demo)")
-            hint = "Contact A, Contact B"
+            hint = "+14155550123, +919876543210"
             minLines = 2
             maxLines = 4
             gravity = Gravity.TOP
@@ -179,9 +181,9 @@ class MainActivity : Activity() {
 
     private fun createAlertsCard(): View {
         val card = createCard()
-        card.addView(sectionTitle("Alert simulation"))
+        card.addView(sectionTitle("SMS delivery status"))
         card.addView(
-            text("Each contact has its own demo status.", 12f, COLOR_MUTED),
+            text("Submitted, delivered, and failed statuses are tracked separately.", 12f, COLOR_MUTED),
             marginParams(top = 3, bottom = 8)
         )
         alertsList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -213,21 +215,65 @@ class MainActivity : Activity() {
         return card
     }
 
-    private fun requestLocationAndStart() {
-        if (hasLocationPermission()) {
-            startSos(hasLocationPermission = true)
+    private fun confirmSos(useLocation: Boolean) {
+        val numbersResult = PhoneNumberValidator.normalizeAll(
+            contactsInput.text.toString().split(",", ";", "\n")
+        )
+        val phoneNumbers = numbersResult.getOrElse { error ->
+            showMessage("Check the phone numbers", error.message ?: "Enter valid phone numbers and try again.")
             return
         }
-        permissionRequestPending = true
-        requestPermissions(
-            arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION),
-            LOCATION_PERMISSION_REQUEST
-        )
+
+        if (coordinator.snapshot().event?.state?.let { it != EmergencyState.CLOSED } == true) {
+            showMessage("Session already active", "End the current session before starting another SOS.")
+            return
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("Send real SOS text messages?")
+            .setMessage(
+                "One SMS will be sent now to each of these numbers:\n\n" +
+                    phoneNumbers.joinToString("\n") +
+                    "\n\nThe SMS will not include your GPS location. Your carrier may charge for messages. " +
+                    "Only continue if you intend to notify these recipients now. For testing, use consenting contacts."
+            )
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Confirm and continue") { _, _ ->
+                requestPermissionsAndStart(phoneNumbers, useLocation)
+            }
+            .show()
     }
 
-    private fun startSos(hasLocationPermission: Boolean) {
-        val contacts = contactsInput.text.toString().split(",", ";", "\n")
-        coordinator.startSos(contacts, hasLocationPermission)
+    private fun requestPermissionsAndStart(phoneNumbers: List<String>, useLocation: Boolean) {
+        val required = buildList {
+            if (checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) {
+                add(Manifest.permission.SEND_SMS)
+            }
+            if (useLocation && !hasLocationPermission()) {
+                add(Manifest.permission.ACCESS_COARSE_LOCATION)
+                add(Manifest.permission.ACCESS_FINE_LOCATION)
+            }
+        }
+        if (required.isEmpty()) {
+            startSos(phoneNumbers, useLocation, hasLocationPermission())
+            return
+        }
+        pendingPhoneNumbers = phoneNumbers
+        pendingUseLocation = useLocation
+        permissionRequestPending = true
+        requestPermissions(required.distinct().toTypedArray(), SOS_PERMISSION_REQUEST)
+    }
+
+    private fun startSos(
+        phoneNumbers: List<String>,
+        useLocation: Boolean,
+        hasLocationPermission: Boolean
+    ) {
+        coordinator.startSos(
+            phoneNumbers = phoneNumbers,
+            hasLocationPermission = useLocation && hasLocationPermission,
+            locationPermissionRequested = useLocation
+        )
     }
 
     private fun hasLocationPermission() =
@@ -241,10 +287,36 @@ class MainActivity : Activity() {
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == LOCATION_PERMISSION_REQUEST && permissionRequestPending) {
+        if (requestCode == SOS_PERMISSION_REQUEST && permissionRequestPending) {
             permissionRequestPending = false
-            startSos(hasLocationPermission())
+            val phoneNumbers = pendingPhoneNumbers
+            pendingPhoneNumbers = null
+            if (phoneNumbers == null) return
+
+            if (checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) {
+                showMessage(
+                    "SMS permission required",
+                    "No SOS session was started and no message was sent. Grant SMS permission to use direct alerts."
+                )
+                return
+            }
+            val locationGranted = pendingUseLocation && hasLocationPermission()
+            if (pendingUseLocation && !locationGranted) {
+                showMessage(
+                    "Location unavailable",
+                    "Location permission was not granted. The confirmed SOS will continue without coordinates."
+                )
+            }
+            startSos(phoneNumbers, pendingUseLocation, locationGranted)
         }
+    }
+
+    private fun showMessage(title: String, message: String) {
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setMessage(message)
+            .setPositiveButton("OK", null)
+            .show()
     }
 
     private fun render() {
@@ -307,10 +379,27 @@ class MainActivity : Activity() {
         event?.alerts?.forEach { attempt ->
             val status = when (attempt.status) {
                 AlertStatus.PENDING -> "PENDING"
-                AlertStatus.SIMULATED_SUBMITTED -> "NOT SENT · DEMO"
+                AlertStatus.SENDING -> "SENDING"
+                AlertStatus.SUBMITTED -> "SUBMITTED · NOT DELIVERED"
+                AlertStatus.SUBMISSION_UNCONFIRMED -> "SUBMISSION UNKNOWN"
+                AlertStatus.DELIVERED -> "DELIVERED"
+                AlertStatus.FAILED -> "FAILED"
+                AlertStatus.DELIVERY_UNCONFIRMED -> "DELIVERY UNKNOWN"
+                AlertStatus.SIMULATED_SUBMITTED -> "LEGACY DEMO"
+            }
+            val (badgeColor, badgeBackground) = when (attempt.status) {
+                AlertStatus.SUBMITTED, AlertStatus.DELIVERED -> COLOR_GREEN_DARK to COLOR_GREEN_TINT
+                AlertStatus.PENDING, AlertStatus.SENDING -> COLOR_MUTED to COLOR_NEUTRAL_TINT
+                else -> COLOR_RED_DARK to COLOR_RED_TINT
             }
             alertsList.addView(
-                labeledRow(attempt.contact, status, COLOR_RED_DARK, COLOR_RED_TINT)
+                LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(labeledRow(attempt.contact, status, badgeColor, badgeBackground))
+                    attempt.statusMessage?.let {
+                        addView(text(it, 11f, COLOR_MUTED), marginParams(bottom = 5))
+                    }
+                }
             )
         }
         if (event?.alerts.isNullOrEmpty()) {
@@ -446,7 +535,7 @@ class MainActivity : Activity() {
         java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date(timeMillis))
 
     companion object {
-        private const val LOCATION_PERMISSION_REQUEST = 101
+        private const val SOS_PERMISSION_REQUEST = 101
         private val COLOR_BACKGROUND = Color.rgb(246, 248, 247)
         private val COLOR_SURFACE_ALT = Color.rgb(245, 247, 246)
         private val COLOR_BORDER = Color.rgb(230, 235, 232)
